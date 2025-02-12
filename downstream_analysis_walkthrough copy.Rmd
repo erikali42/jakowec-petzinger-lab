@@ -1,0 +1,161 @@
+Getting Set Up, Cleaning Data, Running DESeq2
+
+Overview
+The data available on GEO for this study was different from previous datasets I have queried. When using the `getGEO` command, the `SummarizedExperiment` data did not contain expression data, and I was only able to extract the `colData`. To obtain the expression data, I manually downloaded the raw files from GEO.
+
+Installation and Loading Packages
+```{r}
+if (!require("BiocManager", quietly = TRUE)) 
+    install.packages("BiocManager") 
+BiocManager::install("DESeq2") 
+BiocManager::install("EnhancedVolcano")
+BiocManager::install("fgsea")
+install.packages("pheatmap") 
+install.packages("GEOquery") 
+if (!requireNamespace("biomaRt", quietly = TRUE)) {
+    install.packages("biomaRt")
+  
+library(DESeq2)  # For differential expression analysis
+library(EnhancedVolcano)  # For creating volcano plots
+library(pheatmap)  # For creating heatmaps
+library(GEOquery)  # To query GEO data
+library(fgsea)
+library(biomaRt)
+```
+
+Loading and Preparing Data
+```{r}
+# Set directory for raw count files
+counts_folder <- "/Users/erikali/Desktop/jakowec-petzinger-lab/rnaseq/practice_walkthrough/GSE237891_RAW/"
+
+# Read in count files
+gz_files <- list.files(counts_folder, pattern = "counts.txt.gz$", full.names = TRUE)
+counts_list <- lapply(gz_files, function(file) {
+  read.table(gzfile(file), header = TRUE, row.names = 1, sep = "\t")
+})
+
+# Combine into a single matrix
+counts_matrix <- do.call(cbind, counts_list)
+
+# Extract relevant sample columns
+counts_data <- counts_matrix[, grep("^X", colnames(counts_matrix))]
+
+# Query GEO for metadata
+gse <- getGEO("GSE237891", GSEMatrix = TRUE) 
+metadata <- pData(gse[[1]])
+
+# Rename metadata columns for consistency
+colnames(metadata)[colnames(metadata) == "treatment:ch1"] <- "treatment_ch1"
+
+# Ensure column names match
+colnames(counts_data) <- rownames(metadata)
+counts_data <- counts_data[, rownames(metadata)]
+```
+
+Mapping Gene Symbols and Ensembl IDs
+```{r}
+mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")  # Mouse dataset
+
+gene_map <- getBM(
+    attributes = c("ensembl_gene_id", "mgi_symbol"),
+    filters = "ensembl_gene_id",
+    values = rownames(counts_data),
+    mart = mart
+)
+
+# Remove duplicate mappings
+gene_map <- gene_map[!duplicated(gene_map$ensembl_gene_id), ]
+gene_map <- gene_map[!duplicated(gene_map$mgi_symbol), ]
+
+# Create a named vector for mapping
+ensembl_to_symbol <- setNames(gene_map$mgi_symbol, gene_map$ensembl_gene_id)
+
+# Find Ensembl IDs that have a corresponding symbol
+valid_genes <- rownames(counts_data) %in% names(ensembl_to_symbol)
+
+# Filter counts_data to keep only valid genes
+counts_data <- counts_data[valid_genes, , drop = FALSE]
+
+# Map Ensembl IDs to gene symbols, handling missing values
+new_row_names <- ensembl_to_symbol[rownames(counts_data)]
+
+# Ensure no NA values in new row names
+valid_names <- !is.na(new_row_names)
+counts_data <- counts_data[valid_names, , drop = FALSE]
+rownames(counts_data) <- new_row_names[valid_names]
+
+```
+
+Running DESeq2
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = round(counts_data),
+                              colData = metadata,
+                              design = ~ treatment_ch1)
+dds <- DESeq(dds)  
+res <- results(dds)
+```
+
+PCA Plot
+```{r}
+vsd <- vst(dds, blind = FALSE)
+pca_data <- plotPCA(vsd, intgroup = c("treatment_ch1"), returnData = TRUE)
+
+ggplot(pca_data, aes(x = PC1, y = PC2, color = treatment_ch1)) + 
+  geom_point(size = 3) +  
+  labs(title = "PCA of DESeq2 Normalized Data") +  
+  theme_minimal()
+```
+
+Volcano Plot
+```{r, fig.height = 7}
+EnhancedVolcano(res, 
+                lab = rownames(res),
+                x = 'log2FoldChange',
+                y = 'padj',
+                xlim = c(-10, 10),
+                ylim = c(0, 50),
+                pCutoff = 0.05,
+                FCcutoff = 1.5,
+                title = 'Volcano Plot of DESeq2 Results')
+```
+
+Heatmap
+```{r}
+top_genes <- head(order(res$padj), 10)
+top_data <- assay(dds)[top_genes,]
+top_data_normalized <- t(scale(t(top_data)))
+
+pheatmap(top_data_normalized,  
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         show_rownames = TRUE,
+         show_colnames = FALSE,
+         main = 'Heatmap of Top 10 DE Genes')
+```
+
+FGSEA Analysis
+```{r}
+res <- res[!is.na(res$log2FoldChange) & !is.na(res$pvalue), ]
+res$log_pvalue <- -log10(res$pvalue)
+res$signed_stat <- res$log2FoldChange * res$log_pvalue
+
+ranked_genes <- res$signed_stat
+names(ranked_genes) <- rownames(res)
+ranked_genes <- ranked_genes[!is.na(ranked_genes)]
+names(ranked_genes) <- ensembl_to_symbol[names(ranked_genes)]
+ranked_genes <- ranked_genes[!is.na(names(ranked_genes))]
+
+gmt_files <- list.files(path = "/Users/erikali/Desktop/jakowec-petzinger-lab/rnaseq/practice_walkthrough/GMT_files/",
+                        pattern = "\\.gmt$", full.names = TRUE)
+
+gene_sets_list <- lapply(gmt_files, gmtPathways)
+gene_sets <- do.call(c, gene_sets_list)
+
+fgsea_res <- fgsea(pathways = gene_sets,
+                   stats = ranked_genes,
+                   nPermSimple = 1000)
+fgsea_res <- fgsea_res[order(padj),]
+print(fgsea_res)
+```
+
+
