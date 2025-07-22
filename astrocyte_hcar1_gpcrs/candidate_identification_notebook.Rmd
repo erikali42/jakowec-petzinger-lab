@@ -1,0 +1,59 @@
+
+Loading Libraries
+```{r}
+library(tidyverse)
+library(GEOquery)
+```
+
+Extracting Data from GEO
+```{r}
+gse <- GEOquery::getGEO("GSE9566", GSEMatrix = TRUE) # full ExpressionSet object
+matrix <- gse["GSE9566-GPL6096_series_matrix.txt.gz"]$`GSE9566-GPL6096_series_matrix.txt.gz` # data for RNA-seq experiment only
+expression <- exprs(matrix) # expression data
+genes <- fData(matrix) # feature data
+metadata <- pData(matrix) # phenotype data
+```
+
+Data Pre-processing
+```{r}
+astrocyte_ids <- c("GSM241931", "GSM241928", "GSM241936") # extracting only labelled astrocyte experiments
+astrocyte_only_expression <- as.data.frame(expression[, astrocyte_ids])
+
+# keeping only genes with mean raw expression > 100 - "high expression" 
+astrocyte_only_expression$mean_expr <- rowMeans(astrocyte_only_expression)
+astro_high <- astrocyte_only_expression %>% filter(mean_expr > 0) # can tweak this parameter to only get highly expressed genes
+high_genes <- rownames(astro_high)
+genes_filtered <- genes %>% filter(rownames(genes) %in% high_genes)
+
+# merge gene feature data with expression data
+merged_df <- merge(genes_filtered, astro_high, by = 'row.names', all = TRUE)
+cols_to_keep <- c("ID", "gene_assignment", "mrna_assignment", "GSM241931", "GSM241928", "GSM241936")
+merged_df <- merged_df[,cols_to_keep]
+
+# extracting nucleotide refseq ids, clean names up
+merged_df$refseq_ids <- sapply(merged_df$gene_assignment, function(x) {
+  matches <- regmatches(x, gregexpr("\\bNM_\\d+\\b", x))[[1]]
+  paste(unique(matches), collapse = ", ")
+})
+merged_df$refseq_ids <- sub(",.*", "", merged_df$refseq_ids)
+astrocyte_genes <- merged_df$refseq_ids
+
+```
+
+```{r}
+gpcrs <- fread("/Users/erikali/Desktop/astrocyte_hcar1_gpcrs/GPCRTargets.csv") # obtain database of GPCRs from (https://www.guidetopharmacology.org/GRAC/GPCRListForward?class=A)
+mouse_gpcrs <- gpcrs$`Mouse nucleotide RefSeq` # only want the mouse refseq ids
+candidate_gpcrs <- intersect(astrocyte_genes, mouse_gpcrs) # get the overlap between known mouse GPCRs and highly expressed genes in mouse astrocytes
+# save to a csv
+write.csv(candidate_gpcrs, "/Users/erikali/Desktop/astrocyte_hcar1_gpcrs/candidate_gpcrs.csv", row.names = FALSE)
+# write.csv(merged_df$refseq_ids, "/Users/erikali/Desktop/merged.csv", row.names = FALSE)
+```
+
+Input the candidate_gpcrs.csv file into UniProt ID Mapping (https://www.uniprot.org/id-mapping), with input = RefSeq Nucleotide and output = UniProtKB. Save the results as a FASTA file 
+Do the same with just HCAR1, and obtain the corresponding FASTA file.
+Combine the FASTA files so that the final result contains all potential candidate GPCRs and HCAR1 together (can just paste the HCAR1 FASTA to the bottom of the larger FASTA file). 
+
+Take this FASTA file and input into ClustalOmega (https://www.ebi.ac.uk/jdispatcher/msa/clustalo?reJobId=clustalo-I20250722-191624-0939-33596766-p1m&guidetreeout=true&dismatout=false&dealign=false&mbed=true&mbediteration=true&iterations=0&gtiterations=-1&hmmiterations=-1&outfmt=clustal_num&order=aligned&stype=protein), sequence type = Protein, output = ClustalW with character counts. It will output the multiple sequence alignment, percent identity matrix, phylogenetic tree, among other results. 
+
+
+
