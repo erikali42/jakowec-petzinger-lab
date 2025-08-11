@@ -1,0 +1,152 @@
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo = FALSE) 
+library(dplyr)
+library(janitor)
+library(tidyverse)
+library(DESeq2)
+library(EnhancedVolcano)
+library(pheatmap)
+library(knitr)
+library(fgsea)
+library(msigdbr)
+```
+
+```{r}
+# this function essentially adds cleaned names for each column, and adds identifying sample name (B1-B4) and brain region (LSTR or RSTR) columns
+process_file <- function(filepath, sample_name) {
+  df <- read.csv(filepath, header = FALSE, sep = "\t")
+  df$gene_id <- df$V1
+  df$gene_name <- df$V2
+  df[[sample_name]] <- df$V3
+  df <- df[, c("gene_id", "gene_name", sample_name)]
+  return(df)
+}
+
+```
+
+
+```{r}
+# loading in files
+LB1 <- process_file("/Users/erikali/Desktop/6-OHDA/B1LSTR.csv", "B1LSTR")
+LB2 <- process_file("/Users/erikali/Desktop/6-OHDA/B2LSTR.csv", "B2LSTR")
+LB3 <- process_file("/Users/erikali/Desktop/6-OHDA/B3LSTR.csv", "B3LSTR")
+LB4 <- process_file("/Users/erikali/Desktop/6-OHDA/B4LSTR.csv", "B4LSTR")
+
+RB1 <- process_file("/Users/erikali/Desktop/6-OHDA/B1RSTR.csv", "B1RSTR")
+RB2 <- process_file("/Users/erikali/Desktop/6-OHDA/B2RSTR.csv", "B2RSTR")
+RB3 <- process_file("/Users/erikali/Desktop/6-OHDA/B3RSTR.csv", "B3RSTR")
+RB4 <- process_file("/Users/erikali/Desktop/6-OHDA/B4RSTR.csv", "B4RSTR")
+
+# merging all the files
+all_files <- list(LB1, LB2, LB3, LB4, RB1, RB2, RB3, RB4)
+counts_df <- Reduce(function(x, y) merge(x, y, by = c("gene_id", "gene_name"), all = TRUE), all_files)
+counts_df <- counts_df[-c(1,2,3,4,5),]
+rownames(counts_df) <- NULL
+```
+
+```{r}
+# load in metadata
+col_data <- read.csv("/Users/erikali/Desktop/6-OHDA/metadata.csv")
+```
+
+```{r}
+# reformat count_df to run DESeq2 (same # cols as # rows in col_data)
+count_mat <- counts_df %>% 
+  column_to_rownames(var = "gene_id") %>%
+  dplyr::select(-gene_name)
+```
+
+```{r, include=FALSE}
+# differential expression
+dds <- DESeqDataSetFromMatrix(countData = round(count_mat),
+                              colData = col_data,
+                              design = ~ region)
+DEs <- DESeq(dds)
+
+res <- results(DEs,
+               pAdjustMethod = "BH",  
+               name = "region_RSTR_vs_LSTR",  
+               alpha = 0.05,          
+               independentFiltering = TRUE)
+res_sig <- res[which(res$padj < 0.05), ]
+res_sig <- as.data.frame(res_sig)
+res_sig <- res_sig[order(res_sig$padj), ]
+res_sig$gene_symbol <- counts_df$gene_name[match(rownames(res_sig), counts_df$gene_id)]
+kable(res_sig, format = "html", digits = 3, caption = "Significant DE Genes")
+```
+
+There does not appear to be distinct clustering of LSTR vs RSTR in the PCA plot. 
+
+```{r, echo = FALSE}
+# principal component analysis (PCA)
+vst_data <- vst(dds, blind = TRUE)
+counts_matrix <- assay(vst_data)
+var_genes <- order(apply(counts_matrix, 1, var), decreasing = TRUE)[1:500]
+top_counts <- counts_matrix[var_genes, ]
+
+pca_res <- prcomp(t(top_counts))
+
+pca_data <- as.data.frame(pca_res$x)
+pca_data$region <- colData(dds)[["region"]]
+
+ggplot(pca_data, aes_string(x = paste0("PC", 1),
+                            y = paste0("PC", 2),
+                            color = "region")) +
+  geom_point(size = 3) +
+  xlab(paste("PC", 1)) +
+  ylab(paste("PC", 2)) +
+  theme_minimal() +
+  scale_color_discrete(name = "region")
+```
+There are 88 total differentially expressed genes (padj < 0.05)
+
+```{r, fig.height=10}
+volcano_plot <- EnhancedVolcano(res,
+    lab = rownames(res),
+    x = 'log2FoldChange',
+    y = 'pvalue')
+volcano_plot
+```
+
+Below are the top 20 differentially expressed genes. 
+
+```{r}
+sig_genes <- rownames(res_sig)
+top_20 <- order(sig_genes)[1:20]
+heatmap_genes <- counts_matrix[top_20, ]
+
+pheatmap(heatmap_genes,
+         cluster_rows = TRUE,
+         cluster_cols = FALSE,
+         fontsize_row = 8,
+         main = "Top 20 Variable Genes Heatmap")
+
+```
+805 pathways were found to be significantly differentially enriched (padj < 0.05) with the C2 curated gene sets from the Human MSigDB Collections, converted to mouse orthologs with the msigdbr package.
+I've extracted a few particular that might be of interest:
+- REACTOME_GPCR_LIGAND_BINDING
+- REACTOME_PEPTIDE_LIGAND_BINDING_RECEPTORS
+- LEIN_OLIGODENDROCYTE_MARKERS
+- REACTOME_CLASS_A_1_RHODOPSIN_LIKE_RECEPTORS
+- KEGG_NEUROACTIVE_LIGAND_RECEPTOR_INTERACTION
+
+
+```{r, echo=FALSE}
+gene_sets_df <- msigdbr(species = 'mouse', category = 'C2')
+gene_sets <- gene_sets_df %>%
+  split(x = .$ensembl_gene, f = .$gs_name)
+rankings <- sign(res$log2FoldChange)*(-log10(res$pvalue)) # we will use the signed p values as ranking (using padj, which are discrete variables, can lead to ties)
+names(rankings) <- rownames(res)
+rankings <- na.omit(rankings)
+
+GSEAres <- fgsea(pathways = gene_sets, 
+                 stats = rankings,
+                 scoreType = 'std', 
+                 minSize = 10,
+                 maxSize = 500,
+                 nproc = 1) 
+head(GSEAres[order(pval), ])
+
+```
+
